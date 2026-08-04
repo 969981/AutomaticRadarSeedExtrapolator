@@ -13,6 +13,7 @@ RNG Tool and sys-botbase client for Pokémon Brilliant Diamond & Shining Pearl f
 
 A comprehensive usage guide brought to you by [Billo-PS](https://github.com/Billo-PS) can be found **[here](https://billo-guides.github.io/)**.
 
+![Tool Image](https://legofigure11.github.io/tools/desktop/res/ARSE/README.png)
 
 ## Features & shortcuts
 
