@@ -1,0 +1,142 @@
+name: Sync upstream and publish ARSE
+
+on:
+  schedule:
+    - cron: "3,13,23,33,43,53 * * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "docs/**"
+
+concurrency:
+  group: arse-upstream-sync-and-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Check upstream and prepare release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      head_sha: ${{ steps.check.outputs.head_sha }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      should_publish: ${{ steps.check.outputs.should_publish }}
+    steps:
+      - name: Checkout main with complete history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch and merge upstream main
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/LegoFigure11/AutomaticRadarSeedExtrapolator.git
+          git fetch --no-tags upstream main
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            # Preserve our own automation and fail on real conflicts rather than overwrite.
+            git merge --no-edit "$upstream_sha"
+            git push origin HEAD:main
+          fi
+
+          head_sha="$(git rev-parse HEAD)"
+          release_tag="auto-${head_sha:0:12}"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+          # Retry a failed release on the next scheduled run, but never duplicate it.
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "Release $release_tag already exists; no rebuild required."
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "Release $release_tag is missing; build and publish."
+          fi
+
+  build:
+    name: Publish Windows x64
+    needs: sync
+    if: needs.sync.outputs.should_publish == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact synced commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.head_sha }}
+          fetch-depth: 0
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish WinForms for win-x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet publish ARSE.WinForms/ARSE.WinForms.csproj --configuration Release --runtime win-x64 --self-contained false -p:Platform=x64 -p:PublishSingleFile=true --output "$env:RUNNER_TEMP/ARSE-publish"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path "$env:RUNNER_TEMP/ARSE-publish/ARSE.WinForms.exe")) {
+            throw "Expected ARSE.WinForms.exe was not produced."
+          }
+          Compress-Archive -Path "$env:RUNNER_TEMP/ARSE-publish/*" -DestinationPath "$env:RUNNER_TEMP/ARSE-win-x64.zip" -Force
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: arse-win-x64
+          path: ${{ runner.temp }}/ARSE-win-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [sync, build]
+    if: needs.sync.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows package
+        uses: actions/download-artifact@v4
+        with:
+          name: arse-win-x64
+          path: release-assets
+
+      - name: Create deduplicated release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.sync.outputs.release_tag }}
+          HEAD_SHA: ${{ needs.sync.outputs.head_sha }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          test -s release-assets/ARSE-win-x64.zip
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; skip duplicate."
+            exit 0
+          fi
+          gh release create "$TAG" "release-assets/ARSE-win-x64.zip#ARSE-win-x64.zip" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$HEAD_SHA" \
+            --title "ARSE Windows x64 ($TAG)" \
+            --notes "Automated Windows x64 build from synchronized upstream source.\n\nUpstream: https://github.com/LegoFigure11/AutomaticRadarSeedExtrapolator\nUpstream commit: $UPSTREAM_SHA\nBuild commit: $HEAD_SHA\n\nRequires .NET 10 Desktop Runtime (framework-dependent build)." \
+            --latest
